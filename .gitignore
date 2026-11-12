@@ -1,0 +1,13 @@
+*.o
+*.ko
+*.cmd
+*.a
+*.mod.c
+*.symvers
+*.order
+.tmp_*
+*.rej
+*.orig
+out/
+*.dtb
+*.dtbo

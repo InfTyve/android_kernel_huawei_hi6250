@@ -1,0 +1,148 @@
+--- arch/arm64/kernel/traps.c
++++ arch/arm64/kernel/traps.c
+@@ -266,10 +266,12 @@ void die(const char *str, struct pt_regs *regs, int err)
+ {
+ 	struct thread_info *thread = current_thread_info();
+ 	int ret;
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&die_lock, flags);
+ 
+ 	oops_enter();
+ 
+-	raw_spin_lock_irq(&die_lock);
+ 	console_verbose();
+ 	bust_spinlocks(1);
+ 	ret = __die(str, err, thread, regs);
+--- drivers/usb/core/config.c
++++ drivers/usb/core/config.c
+@@ -763,18 +763,21 @@ void usb_destroy_configuration(struct usb_device *dev)
+ 		return;
+ 
+ 	if (dev->rawdescriptors) {
+-		for (i = 0; i < dev->descriptor.bNumConfigurations; i++)
++		for (i = 0; i < dev->descriptor.bNumConfigurations &&
++				i < USB_MAXCONFIG; i++)
+ 			kfree(dev->rawdescriptors[i]);
+ 
+ 		kfree(dev->rawdescriptors);
+ 		dev->rawdescriptors = NULL;
+ 	}
+ 
+-	for (c = 0; c < dev->descriptor.bNumConfigurations; c++) {
++	for (c = 0; c < dev->descriptor.bNumConfigurations &&
++			c < USB_MAXCONFIG; c++) {
+ 		struct usb_host_config *cf = &dev->config[c];
+ 
+ 		kfree(cf->string);
+-		for (i = 0; i < cf->desc.bNumInterfaces; i++) {
++		for (i = 0; i < cf->desc.bNumInterfaces &&
++				i < USB_MAXINTERFACES; i++) {
+ 			if (cf->intf_cache[i])
+ 				kref_put(&cf->intf_cache[i]->ref,
+ 					  usb_release_interface_cache);
+--- fs/dcache.c
++++ fs/dcache.c
+@@ -1522,7 +1522,7 @@ static void check_and_drop(void *_data)
+ {
+ 	struct detach_data *data = _data;
+ 
+-	if (!data->mountpoint && !data->select.found)
++	if (!data->mountpoint && list_empty(&data->select.dispose))
+ 		__d_drop(data->select.start);
+ }
+ 
+@@ -1564,17 +1564,15 @@ void d_invalidate(struct dentry *dentry)
+ 
+ 		d_walk(dentry, &data, detach_and_collect, check_and_drop);
+ 
+-		if (data.select.found)
++		if (!list_empty(&data.select.dispose))
+ 			shrink_dentry_list(&data.select.dispose);
++		else if (!data.mountpoint)
++			return;
+ 
+ 		if (data.mountpoint) {
+ 			detach_mounts(data.mountpoint);
+ 			dput(data.mountpoint);
+ 		}
+-
+-		if (!data.mountpoint && !data.select.found)
+-			break;
+-
+ 		cond_resched();
+ 	}
+ }
+--- include/net/inet_connection_sock.h
++++ include/net/inet_connection_sock.h
+@@ -289,11 +289,6 @@ static inline int inet_csk_reqsk_queue_len(const struct sock *sk)
+ 	return reqsk_queue_len(&inet_csk(sk)->icsk_accept_queue);
+ }
+ 
+-static inline int inet_csk_reqsk_queue_young(const struct sock *sk)
+-{
+-	return reqsk_queue_len_young(&inet_csk(sk)->icsk_accept_queue);
+-}
+-
+ static inline int inet_csk_reqsk_queue_is_full(const struct sock *sk)
+ {
+ 	return inet_csk_reqsk_queue_len(sk) >= sk->sk_max_ack_backlog;
+--- net/dccp/ipv4.c
++++ net/dccp/ipv4.c
+@@ -596,13 +596,7 @@ int dccp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+ 	if (inet_csk_reqsk_queue_is_full(sk))
+ 		goto drop;
+ 
+-	/*
+-	 * Accept backlog is full. If we have already queued enough
+-	 * of warm entries in syn queue, drop request. It is better than
+-	 * clogging syn queue with openreqs with exponentially increasing
+-	 * timeout.
+-	 */
+-	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
++	if (sk_acceptq_is_full(sk))
+ 		goto drop;
+ 
+ 	req = inet_reqsk_alloc(&dccp_request_sock_ops, sk, true);
+--- net/dccp/ipv6.c
++++ net/dccp/ipv6.c
+@@ -328,7 +328,7 @@ static int dccp_v6_conn_request(struct sock *sk, struct sk_buff *skb)
+ 	if (inet_csk_reqsk_queue_is_full(sk))
+ 		goto drop;
+ 
+-	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1)
++	if (sk_acceptq_is_full(sk))
+ 		goto drop;
+ 
+ 	req = inet_reqsk_alloc(&dccp6_request_sock_ops, sk, true);
+--- net/ipv4/tcp_input.c
++++ net/ipv4/tcp_input.c
+@@ -6374,13 +6374,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 			goto drop;
+ 	}
+ 
+-
+-	/* Accept backlog is full. If we have already queued enough
+-	 * of warm entries in syn queue, drop request. It is better than
+-	 * clogging syn queue with openreqs with exponentially increasing
+-	 * timeout.
+-	 */
+-	if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
++	if (sk_acceptq_is_full(sk)) {
+ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+ 		goto drop;
+ 	}
+--- tools/objtool/check.c
++++ tools/objtool/check.c
+@@ -2132,9 +2132,10 @@ static void cleanup(struct objtool_file *file)
+ 	elf_close(file->elf);
+ }
+ 
++static struct objtool_file file;
++
+ int check(const char *_objname, bool orc)
+ {
+-	struct objtool_file file;
+ 	int ret, warnings = 0;
+ 
+ 	objname = _objname;

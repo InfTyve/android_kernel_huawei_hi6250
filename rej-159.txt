@@ -1,0 +1,168 @@
+--- arch/arm/include/asm/thread_info.h
++++ arch/arm/include/asm/thread_info.h
+@@ -124,8 +124,8 @@ extern void vfp_flush_hwstate(struct thread_info *);
+ struct user_vfp;
+ struct user_vfp_exc;
+ 
+-extern int vfp_preserve_user_clear_hwstate(struct user_vfp __user *,
+-					   struct user_vfp_exc __user *);
++extern int vfp_preserve_user_clear_hwstate(struct user_vfp *,
++					   struct user_vfp_exc *);
+ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ 				    struct user_vfp_exc *);
+ #endif
+--- arch/arm/lib/copy_from_user.S
++++ arch/arm/lib/copy_from_user.S
+@@ -93,11 +93,7 @@ ENTRY(arm_copy_from_user)
+ #ifdef CONFIG_CPU_SPECTRE
+ 	get_thread_info r3
+ 	ldr	r3, [r3, #TI_ADDR_LIMIT]
+-	adds	ip, r1, r2	@ ip=addr+size
+-	sub	r3, r3, #1	@ addr_limit - 1
+-	cmpcc	ip, r3		@ if (addr+size > addr_limit - 1)
+-	movcs	r1, #0		@ addr = NULL
+-	csdb
++	uaccess_mask_range_ptr r1, r2, r3, ip
+ #endif
+ 
+ #include "copy_template.S"
+--- arch/arm/mm/proc-macros.S
++++ arch/arm/mm/proc-macros.S
+@@ -275,6 +275,13 @@
+ 	.endm
+ 
+ .macro define_processor_functions name:req, dabort:req, pabort:req, nommu=0, suspend=0, bugs=0
++/*
++ * If we are building for big.Little with branch predictor hardening,
++ * we need the processor function tables to remain available after boot.
++ */
++#if defined(CONFIG_BIG_LITTLE) && defined(CONFIG_HARDEN_BRANCH_PREDICTOR)
++	.section ".rodata"
++#endif
+ 	.type	\name\()_processor_functions, #object
+ 	.align 2
+ ENTRY(\name\()_processor_functions)
+--- arch/x86/events/perf_event.h
++++ arch/x86/events/perf_event.h
+@@ -849,7 +854,14 @@ static inline bool intel_pmu_has_bts(struct perf_event *event)
+ 	hw_event = hwc->config & INTEL_ARCH_EVENT_MASK;
+ 	bts_event = x86_pmu.event_map(PERF_COUNT_HW_BRANCH_INSTRUCTIONS);
+ 
+-	return hw_event == bts_event && hwc->sample_period == 1;
++	return hw_event == bts_event && period == 1;
++}
++
++static inline bool intel_pmu_has_bts(struct perf_event *event)
++{
++	struct hw_perf_event *hwc = &event->hw;
++
++	return intel_pmu_has_bts_period(event, hwc->sample_period);
+ }
+ 
+ int intel_pmu_save_and_restart(struct perf_event *event);
+--- arch/x86/kvm/vmx.c
++++ arch/x86/kvm/vmx.c
+@@ -2178,7 +2178,8 @@ static void add_atomic_switch_msr(struct vcpu_vmx *vmx, unsigned msr,
+ 	if (!entry_only)
+ 		j = find_msr(&m->host, msr);
+ 
+-	if (i == NR_AUTOLOAD_MSRS || j == NR_AUTOLOAD_MSRS) {
++	if ((i < 0 && m->guest.nr == NR_AUTOLOAD_MSRS) ||
++		(j < 0 &&  m->host.nr == NR_AUTOLOAD_MSRS)) {
+ 		printk_once(KERN_WARNING "Not enough msr switch entries. "
+ 				"Can't add msr %x\n", msr);
+ 		return;
+--- drivers/gpu/drm/bridge/tc358767.c
++++ drivers/gpu/drm/bridge/tc358767.c
+@@ -1122,10 +1135,20 @@ static bool tc_bridge_mode_fixup(struct drm_bridge *bridge,
+ static int tc_connector_mode_valid(struct drm_connector *connector,
+ 				   struct drm_display_mode *mode)
+ {
++	struct tc_data *tc = connector_to_tc(connector);
++	u32 req, avail;
++	u32 bits_per_pixel = 24;
++
+ 	/* DPI interface clock limitation: upto 154 MHz */
+ 	if (mode->clock > 154000)
+ 		return MODE_CLOCK_HIGH;
+ 
++	req = mode->clock * bits_per_pixel / 8;
++	avail = tc->link.base.num_lanes * tc->link.base.rate;
++
++	if (req > avail)
++		return MODE_BAD;
++
+ 	return MODE_OK;
+ }
+ 
+--- drivers/input/mouse/elan_i2c_core.c
++++ drivers/input/mouse/elan_i2c_core.c
+@@ -1250,6 +1249,7 @@ static const struct acpi_device_id elan_acpi_id[] = {
+ 	{ "ELAN060C", 0 },
+ 	{ "ELAN0611", 0 },
+ 	{ "ELAN0612", 0 },
++	{ "ELAN0617", 0 },
+ 	{ "ELAN0618", 0 },
+ 	{ "ELAN061C", 0 },
+ 	{ "ELAN061D", 0 },
+--- kernel/trace/trace_uprobe.c
++++ kernel/trace/trace_uprobe.c
+@@ -150,7 +150,14 @@ static void FETCH_FUNC_NAME(memory, string)(struct pt_regs *regs,
+ 
+ 	ret = strncpy_from_user(dst, src, maxlen);
+ 	if (ret == maxlen)
+-		dst[--ret] = '\0';
++		dst[ret - 1] = '\0';
++	else if (ret >= 0)
++		/*
++		 * Include the terminating null byte. In this case it
++		 * was copied by strncpy_from_user but not accounted
++		 * for in ret.
++		 */
++		ret++;
+ 
+ 	if (ret < 0) {	/* Failed to fetch string */
+ 		((u8 *)get_rloc_data(dest))[0] = '\0';
+--- mm/memory.c
++++ mm/memory.c
+@@ -3329,15 +3329,24 @@ static int do_fault(struct fault_env *fe)
+ {
+ 	struct vm_area_struct *vma = fe->vma;
+ 	pgoff_t pgoff = linear_page_index(vma, fe->address);
++	int ret;
+ 
+ 	/* The VMA was not fully populated on mmap() or missing VM_DONTEXPAND */
+ 	if (!vma->vm_ops->fault)
+-		return VM_FAULT_SIGBUS;
+-	if (!(fe->flags & FAULT_FLAG_WRITE))
+-		return do_read_fault(fe, pgoff);
+-	if (!(vma->vm_flags & VM_SHARED))
+-		return do_cow_fault(fe, pgoff);
+-	return do_shared_fault(fe, pgoff);
++		ret = VM_FAULT_SIGBUS;
++	else if (!(fe->flags & FAULT_FLAG_WRITE))
++		ret = do_read_fault(fe, pgoff);
++	else if (!(vma->vm_flags & VM_SHARED))
++		ret = do_cow_fault(fe, pgoff);
++	else
++		ret = do_shared_fault(fe, pgoff);
++
++	/* preallocated pagetable is unused: free it */
++	if (fe->prealloc_pte) {
++		pte_free(vma->vm_mm, fe->prealloc_pte);
++		fe->prealloc_pte = 0;
++	}
++	return ret;
+ }
+ 
+ static int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
+--- sound/pci/hda/patch_conexant.c
++++ sound/pci/hda/patch_conexant.c
+@@ -854,6 +854,7 @@ static const struct snd_pci_quirk cxt5066_fixups[] = {
+ 	SND_PCI_QUIRK(0x103c, 0x807C, "HP EliteBook 820 G3", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x80FD, "HP ProBook 640 G2", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x828c, "HP EliteBook 840 G4", CXT_FIXUP_HP_DOCK),
++	SND_PCI_QUIRK(0x103c, 0x83b2, "HP EliteBook 840 G5", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x83b3, "HP EliteBook 830 G5", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x83d3, "HP ProBook 640 G4", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x8174, "HP Spectre x360", CXT_FIXUP_HP_SPECTRE),

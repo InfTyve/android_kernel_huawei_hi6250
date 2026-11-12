@@ -1,0 +1,101 @@
+--- drivers/mmc/host/sdhci.c
++++ drivers/mmc/host/sdhci.c
+@@ -944,8 +944,7 @@ static bool sdhci_needs_reset(struct sdhci_host *host, struct mmc_request *mrq)
+ 	return (!(host->flags & SDHCI_DEVICE_DEAD) &&
+ 		((mrq->cmd && mrq->cmd->error) ||
+ 		 (mrq->sbc && mrq->sbc->error) ||
+-		 (mrq->data && ((mrq->data->error && !mrq->data->stop) ||
+-				(mrq->data->stop && mrq->data->stop->error))) ||
++		 (mrq->data && mrq->data->stop && mrq->data->stop->error) ||
+ 		 (host->quirks & SDHCI_QUIRK_RESET_AFTER_REQUEST)));
+ }
+ 
+@@ -2479,20 +2477,12 @@ static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask)
+ 		else
+ 			host->cmd->error = -EILSEQ;
+ 
+-		/*
+-		 * If this command initiates a data phase and a response
+-		 * CRC error is signalled, the card can start transferring
+-		 * data - the card may have received the command without
+-		 * error.  We must not terminate the mmc_request early.
+-		 *
+-		 * If the card did not receive the command or returned an
+-		 * error which prevented it sending data, the data phase
+-		 * will time out.
+-		 */
++		/* Treat data command CRC error the same as data CRC error */
+ 		if (host->cmd->data &&
+ 		    (intmask & (SDHCI_INT_CRC | SDHCI_INT_TIMEOUT)) ==
+ 		     SDHCI_INT_CRC) {
+ 			host->cmd = NULL;
++			*intmask_p |= SDHCI_INT_DATA_CRC;
+ 			return;
+ 		}
+ 
+--- drivers/scsi/libfc/fc_rport.c
++++ drivers/scsi/libfc/fc_rport.c
+@@ -1935,7 +1935,6 @@ static void fc_rport_recv_logo_req(struct fc_lport *lport, struct fc_frame *fp)
+ 		FC_RPORT_DBG(rdata, "Received LOGO request while in state %s\n",
+ 			     fc_rport_state(rdata));
+ 
+-		rdata->flags &= ~FC_RP_STARTED;
+ 		fc_rport_enter_delete(rdata, RPORT_EV_STOP);
+ 		mutex_unlock(&rdata->rp_mutex);
+ 		kref_put(&rdata->kref, rdata->local_port->tt.rport_destroy);
+--- kernel/kprobes.c
++++ kernel/kprobes.c
+@@ -668,7 +668,6 @@ static void unoptimize_kprobe(struct kprobe *p, bool force)
+ static int reuse_unused_kprobe(struct kprobe *ap)
+ {
+ 	struct optimized_kprobe *op;
+-	int ret;
+ 
+ 	BUG_ON(!kprobe_unused(ap));
+ 	/*
+@@ -682,9 +681,8 @@ static int reuse_unused_kprobe(struct kprobe *ap)
+ 	/* Enable the probe again */
+ 	ap->flags &= ~KPROBE_FLAG_DISABLED;
+ 	/* Optimize it again (remove from op->list) */
+-	ret = kprobe_optready(ap);
+-	if (ret)
+-		return ret;
++	if (!kprobe_optready(ap))
++		return -EINVAL;
+ 
+ 	optimize_kprobe(ap);
+ 	return 0;
+--- kernel/trace/ftrace.c
++++ kernel/trace/ftrace.c
+@@ -5310,11 +5311,13 @@ static void ftrace_ops_list_func(unsigned long ip, unsigned long parent_ip,
+ {
+ 	__ftrace_ops_list_func(ip, parent_ip, NULL, regs);
+ }
++NOKPROBE_SYMBOL(ftrace_ops_list_func);
+ #else
+ static void ftrace_ops_no_ops(unsigned long ip, unsigned long parent_ip)
+ {
+ 	__ftrace_ops_list_func(ip, parent_ip, NULL, NULL);
+ }
++NOKPROBE_SYMBOL(ftrace_ops_no_ops);
+ #endif
+ 
+ /*
+--- net/ipv4/tcp_input.c
++++ net/ipv4/tcp_input.c
+@@ -389,11 +389,12 @@ static int __tcp_grow_window(const struct sock *sk, const struct sk_buff *skb)
+ static void tcp_grow_window(struct sock *sk, const struct sk_buff *skb)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
++	int room;
++
++	room = min_t(int, tp->window_clamp, tcp_space(sk)) - tp->rcv_ssthresh;
+ 
+ 	/* Check #1 */
+-	if (tp->rcv_ssthresh < tp->window_clamp &&
+-	    (int)tp->rcv_ssthresh < tcp_space(sk) &&
+-	    !tcp_under_memory_pressure(sk)) {
++	if (room > 0 && !tcp_under_memory_pressure(sk)) {
+ 		int incr;
+ 
+ 		/* Check #2. Increase window, if skb with such overhead

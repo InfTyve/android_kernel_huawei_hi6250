@@ -1,0 +1,280 @@
+--- Makefile
++++ Makefile
+@@ -507,7 +507,7 @@ endif
+ ifeq ($(cc-name),clang)
+ ifneq ($(CROSS_COMPILE),)
+ CLANG_FLAGS	:= --target=$(notdir $(CROSS_COMPILE:%-=%))
+-GCC_TOOLCHAIN_DIR := $(dir $(shell which $(LD)))
++GCC_TOOLCHAIN_DIR := $(dir $(shell which $(CROSS_COMPILE)elfedit))
+ CLANG_FLAGS	+= --prefix=$(GCC_TOOLCHAIN_DIR)
+ GCC_TOOLCHAIN	:= $(realpath $(GCC_TOOLCHAIN_DIR)/..)
+ endif
+--- arch/arm64/mm/init.c
++++ arch/arm64/mm/init.c
+@@ -272,7 +272,7 @@ void __init arm64_memblock_init(void)
+ 		 * memory spans, randomize the linear region as well.
+ 		 */
+ 		if (memstart_offset_seed > 0 && range >= ARM64_MEMSTART_ALIGN) {
+-			range = range / ARM64_MEMSTART_ALIGN + 1;
++			range /= ARM64_MEMSTART_ALIGN;
+ 			memstart_addr -= ARM64_MEMSTART_ALIGN *
+ 					 ((range * memstart_offset_seed) >> 16);
+ 		}
+--- arch/powerpc/Kconfig
++++ arch/powerpc/Kconfig
+@@ -128,7 +128,7 @@ config PPC
+ 	select ARCH_HAS_GCOV_PROFILE_ALL
+ 	select GENERIC_SMP_IDLE_THREAD
+ 	select GENERIC_CMOS_UPDATE
+-	select GENERIC_CPU_VULNERABILITIES	if PPC_BOOK3S_64
++	select GENERIC_CPU_VULNERABILITIES	if PPC_BARRIER_NOSPEC
+ 	select GENERIC_TIME_VSYSCALL_OLD
+ 	select GENERIC_CLOCKEVENTS
+ 	select GENERIC_CLOCKEVENTS_BROADCAST if SMP
+--- arch/powerpc/include/asm/feature-fixups.h
++++ arch/powerpc/include/asm/feature-fixups.h
+@@ -239,6 +258,8 @@ extern long stf_barrier_fallback;
+ extern long __start___stf_entry_barrier_fixup, __stop___stf_entry_barrier_fixup;
+ extern long __start___stf_exit_barrier_fixup, __stop___stf_exit_barrier_fixup;
+ extern long __start___rfi_flush_fixup, __stop___rfi_flush_fixup;
++extern long __start___barrier_nospec_fixup, __stop___barrier_nospec_fixup;
++extern long __start__btb_flush_fixup, __stop__btb_flush_fixup;
+ 
+ #endif
+ 
+--- arch/powerpc/include/asm/hvcall.h
++++ arch/powerpc/include/asm/hvcall.h
+@@ -316,10 +316,12 @@
+ #define H_CPU_CHAR_BRANCH_HINTS_HONORED	(1ull << 58) // IBM bit 5
+ #define H_CPU_CHAR_THREAD_RECONFIG_CTRL	(1ull << 57) // IBM bit 6
+ #define H_CPU_CHAR_COUNT_CACHE_DISABLED	(1ull << 56) // IBM bit 7
++#define H_CPU_CHAR_BCCTR_FLUSH_ASSIST	(1ull << 54) // IBM bit 9
+ 
+ #define H_CPU_BEHAV_FAVOUR_SECURITY	(1ull << 63) // IBM bit 0
+ #define H_CPU_BEHAV_L1D_FLUSH_PR	(1ull << 62) // IBM bit 1
+ #define H_CPU_BEHAV_BNDS_CHK_SPEC_BAR	(1ull << 61) // IBM bit 2
++#define H_CPU_BEHAV_FLUSH_COUNT_CACHE	(1ull << 58) // IBM bit 5
+ 
+ #ifndef __ASSEMBLY__
+ #include <linux/types.h>
+--- arch/powerpc/include/asm/setup.h
++++ arch/powerpc/include/asm/setup.h
+@@ -51,6 +52,26 @@ enum l1d_flush_type {
+ 
+ void setup_rfi_flush(enum l1d_flush_type, bool enable);
+ void do_rfi_flush_fixups(enum l1d_flush_type types);
++#ifdef CONFIG_PPC_BARRIER_NOSPEC
++void setup_barrier_nospec(void);
++#else
++static inline void setup_barrier_nospec(void) { };
++#endif
++void do_barrier_nospec_fixups(bool enable);
++extern bool barrier_nospec_enabled;
++
++#ifdef CONFIG_PPC_BARRIER_NOSPEC
++void do_barrier_nospec_fixups_range(bool enable, void *start, void *end);
++#else
++static inline void do_barrier_nospec_fixups_range(bool enable, void *start, void *end) { };
++#endif
++
++#ifdef CONFIG_PPC_FSL_BOOK3E
++void setup_spectre_v2(void);
++#else
++static inline void setup_spectre_v2(void) {};
++#endif
++void do_btb_flush_fixups(void);
+ 
+ #endif /* !__ASSEMBLY__ */
+ 
+--- arch/powerpc/kernel/Makefile
++++ arch/powerpc/kernel/Makefile
+@@ -44,9 +44,10 @@ obj-$(CONFIG_PPC64)		+= setup_64.o sys_ppc32.o \
+ obj-$(CONFIG_VDSO32)		+= vdso32/
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
+ obj-$(CONFIG_PPC_BOOK3S_64)	+= cpu_setup_ppc970.o cpu_setup_pa6t.o
+-obj-$(CONFIG_PPC_BOOK3S_64)	+= cpu_setup_power.o security.o
++obj-$(CONFIG_PPC_BOOK3S_64)	+= cpu_setup_power.o
+ obj-$(CONFIG_PPC_BOOK3S_64)	+= mce.o mce_power.o
+ obj-$(CONFIG_PPC_BOOK3E_64)	+= exceptions-64e.o idle_book3e.o
++obj-$(CONFIG_PPC_BARRIER_NOSPEC) += security.o
+ obj-$(CONFIG_PPC64)		+= vdso64/
+ obj-$(CONFIG_ALTIVEC)		+= vecemu.o
+ obj-$(CONFIG_PPC_970_NAP)	+= idle_power4.o
+--- arch/powerpc/kernel/vmlinux.lds.S
++++ arch/powerpc/kernel/vmlinux.lds.S
+@@ -153,8 +153,25 @@ SECTIONS
+ 		*(__rfi_flush_fixup)
+ 		__stop___rfi_flush_fixup = .;
+ 	}
+-#endif
++#endif /* CONFIG_PPC64 */
++
++#ifdef CONFIG_PPC_BARRIER_NOSPEC
++	. = ALIGN(8);
++	__spec_barrier_fixup : AT(ADDR(__spec_barrier_fixup) - LOAD_OFFSET) {
++		__start___barrier_nospec_fixup = .;
++		*(__barrier_nospec_fixup)
++		__stop___barrier_nospec_fixup = .;
++	}
++#endif /* CONFIG_PPC_BARRIER_NOSPEC */
+ 
++#ifdef CONFIG_PPC_FSL_BOOK3E
++	. = ALIGN(8);
++	__spec_btb_flush_fixup : AT(ADDR(__spec_btb_flush_fixup) - LOAD_OFFSET) {
++		__start__btb_flush_fixup = .;
++		*(__btb_flush_fixup)
++		__stop__btb_flush_fixup = .;
++	}
++#endif
+ 	EXCEPTION_TABLE(0)
+ 
+ 	NOTES :kernel :notes
+--- arch/powerpc/lib/feature-fixups.c
++++ arch/powerpc/lib/feature-fixups.c
+@@ -277,8 +277,101 @@ void do_rfi_flush_fixups(enum l1d_flush_type types)
+ 		(types &  L1D_FLUSH_MTTRIG)     ? "mttrig type"
+ 						: "unknown");
+ }
++
++void do_barrier_nospec_fixups_range(bool enable, void *fixup_start, void *fixup_end)
++{
++	unsigned int instr, *dest;
++	long *start, *end;
++	int i;
++
++	start = fixup_start;
++	end = fixup_end;
++
++	instr = 0x60000000; /* nop */
++
++	if (enable) {
++		pr_info("barrier-nospec: using ORI speculation barrier\n");
++		instr = 0x63ff0000; /* ori 31,31,0 speculation barrier */
++	}
++
++	for (i = 0; start < end; start++, i++) {
++		dest = (void *)start + *start;
++
++		pr_devel("patching dest %lx\n", (unsigned long)dest);
++		patch_instruction(dest, instr);
++	}
++
++	printk(KERN_DEBUG "barrier-nospec: patched %d locations\n", i);
++}
++
+ #endif /* CONFIG_PPC_BOOK3S_64 */
+ 
++#ifdef CONFIG_PPC_BARRIER_NOSPEC
++void do_barrier_nospec_fixups(bool enable)
++{
++	void *start, *end;
++
++	start = PTRRELOC(&__start___barrier_nospec_fixup),
++	end = PTRRELOC(&__stop___barrier_nospec_fixup);
++
++	do_barrier_nospec_fixups_range(enable, start, end);
++}
++#endif /* CONFIG_PPC_BARRIER_NOSPEC */
++
++#ifdef CONFIG_PPC_FSL_BOOK3E
++void do_barrier_nospec_fixups_range(bool enable, void *fixup_start, void *fixup_end)
++{
++	unsigned int instr[2], *dest;
++	long *start, *end;
++	int i;
++
++	start = fixup_start;
++	end = fixup_end;
++
++	instr[0] = PPC_INST_NOP;
++	instr[1] = PPC_INST_NOP;
++
++	if (enable) {
++		pr_info("barrier-nospec: using isync; sync as speculation barrier\n");
++		instr[0] = PPC_INST_ISYNC;
++		instr[1] = PPC_INST_SYNC;
++	}
++
++	for (i = 0; start < end; start++, i++) {
++		dest = (void *)start + *start;
++
++		pr_devel("patching dest %lx\n", (unsigned long)dest);
++		patch_instruction(dest, instr[0]);
++		patch_instruction(dest + 1, instr[1]);
++	}
++
++	printk(KERN_DEBUG "barrier-nospec: patched %d locations\n", i);
++}
++
++static void patch_btb_flush_section(long *curr)
++{
++	unsigned int *start, *end;
++
++	start = (void *)curr + *curr;
++	end = (void *)curr + *(curr + 1);
++	for (; start < end; start++) {
++		pr_devel("patching dest %lx\n", (unsigned long)start);
++		patch_instruction(start, PPC_INST_NOP);
++	}
++}
++
++void do_btb_flush_fixups(void)
++{
++	long *start, *end;
++
++	start = PTRRELOC(&__start__btb_flush_fixup);
++	end = PTRRELOC(&__stop__btb_flush_fixup);
++
++	for (; start < end; start += 2)
++		patch_btb_flush_section(start);
++}
++#endif /* CONFIG_PPC_FSL_BOOK3E */
++
+ void do_lwsync_fixups(unsigned long value, void *fixup_start, void *fixup_end)
+ {
+ 	long *start, *end;
+--- arch/powerpc/platforms/powernv/setup.c
++++ arch/powerpc/platforms/powernv/setup.c
+@@ -129,6 +135,7 @@ static void pnv_setup_rfi_flush(void)
+ 		  security_ftr_enabled(SEC_FTR_L1D_FLUSH_HV));
+ 
+ 	setup_rfi_flush(type, enable);
++	setup_count_cache_flush();
+ }
+ 
+ static void __init pnv_setup_arch(void)
+--- arch/powerpc/platforms/pseries/setup.c
++++ arch/powerpc/platforms/pseries/setup.c
+@@ -531,6 +537,7 @@ void pseries_setup_rfi_flush(void)
+ 		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_PR);
+ 
+ 	setup_rfi_flush(types, enable);
++	setup_count_cache_flush();
+ }
+ 
+ static void __init pSeries_setup_arch(void)
+--- block/bio.c
++++ block/bio.c
+@@ -1214,8 +1214,11 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
+ 			}
+ 		}
+ 
+-		if (bio_add_pc_page(q, bio, page, bytes, offset) < bytes)
++		if (bio_add_pc_page(q, bio, page, bytes, offset) < bytes) {
++			if (!map_data)
++				__free_page(page);
+ 			break;
++		}
+ 
+ 		len -= bytes;
+ 		offset = 0;
+--- drivers/net/usb/qmi_wwan.c
++++ drivers/net/usb/qmi_wwan.c
+@@ -890,6 +890,7 @@ static const struct usb_device_id products[] = {
+ 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
+ 	{QMI_FIXED_INTF(0x2001, 0x7e19, 4)},	/* D-Link DWM-221 B1 */
+ 	{QMI_FIXED_INTF(0x2001, 0x7e35, 4)},	/* D-Link DWM-222 */
++	{QMI_FIXED_INTF(0x2020, 0x2031, 4)},	/* Olicard 600 */
+ 	{QMI_FIXED_INTF(0x2020, 0x2033, 4)},	/* BroadMobi BM806U */
+ 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
+ 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */

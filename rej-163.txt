@@ -1,0 +1,112 @@
+--- arch/arm/kernel/entry-common.S
++++ arch/arm/kernel/entry-common.S
+@@ -225,7 +227,7 @@ local_restart:
+ 	tst	r10, #_TIF_SYSCALL_WORK		@ are we tracing syscalls?
+ 	bne	__sys_trace
+ 
+-	invoke_syscall tbl, scno, r10, ret_fast_syscall
++	invoke_syscall tbl, scno, r10, __ret_fast_syscall
+ 
+ 	add	r1, sp, #S_OFF
+ 2:	cmp	scno, #(__ARM_NR_BASE - __NR_SYSCALL_BASE)
+--- arch/mips/kernel/process.c
++++ arch/mips/kernel/process.c
+@@ -356,10 +356,9 @@ static int get_frame_info(struct mips_frame_info *info)
+ 	if (!ip)
+ 		goto err;
+ 
+-	ip_end = (void *)ip + info->func_size;
+-
+-	for (i = 0; i < max_insns && ip < ip_end; i++) {
++	for (i = 0; i < max_insns; i++) {
+ 		ip = (void *)ip + last_insn_size;
++
+ 		if (is_mmips && mm_insn_16bit(ip->halfword[0])) {
+ 			insn.halfword[0] = 0;
+ 			insn.halfword[1] = ip->halfword[0];
+--- arch/x86/include/asm/cpufeatures.h
++++ arch/x86/include/asm/cpufeatures.h
+@@ -314,6 +314,7 @@
+ /* Intel-defined CPU features, CPUID level 0x00000007:0 (EDX), word 18 */
+ #define X86_FEATURE_AVX512_4VNNIW	(18*32+ 2) /* AVX-512 Neural Network Instructions */
+ #define X86_FEATURE_AVX512_4FMAPS	(18*32+ 3) /* AVX-512 Multiply Accumulation Single precision */
++#define X86_FEATURE_TSX_FORCE_ABORT	(18*32+13) /* "" TSX_FORCE_ABORT */
+ #define X86_FEATURE_PCONFIG		(18*32+18) /* Intel PCONFIG */
+ #define X86_FEATURE_SPEC_CTRL		(18*32+26) /* "" Speculation Control (IBRS + IBPB) */
+ #define X86_FEATURE_INTEL_STIBP		(18*32+27) /* "" Single Thread Indirect Branch Predictors */
+--- arch/x86/kernel/cpu/amd.c
++++ arch/x86/kernel/cpu/amd.c
+@@ -765,11 +765,9 @@ static void init_amd_bd(struct cpuinfo_x86 *c)
+ static void init_amd_zn(struct cpuinfo_x86 *c)
+ {
+ 	set_cpu_cap(c, X86_FEATURE_ZEN);
+-	/*
+-	 * Fix erratum 1076: CPB feature bit not being set in CPUID. It affects
+-	 * all up to and including B1.
+-	 */
+-	if (c->x86_model <= 1 && c->x86_stepping <= 1)
++
++	/* Fix erratum 1076: CPB feature bit not being set in CPUID. */
++	if (!cpu_has(c, X86_FEATURE_CPB))
+ 		set_cpu_cap(c, X86_FEATURE_CPB);
+ }
+ 
+--- drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -342,6 +343,7 @@ static int sun4i_tcon_init_clocks(struct device *dev,
+ 
+ static void sun4i_tcon_free_clocks(struct sun4i_tcon *tcon)
+ {
++	clk_disable_unprepare(tcon->sclk0);
+ 	clk_disable_unprepare(tcon->clk);
+ }
+ 
+--- drivers/staging/android/ion/ion_system_heap.c
++++ drivers/staging/android/ion/ion_system_heap.c
+@@ -307,10 +307,10 @@ static int ion_system_heap_create_pools(struct ion_page_pool **pools,
+ 					bool cached)
+ {
+ 	int i;
+-	gfp_t gfp_flags = low_order_gfp_flags;
+ 
+ 	for (i = 0; i < NUM_ORDERS; i++) {
+ 		struct ion_page_pool *pool;
++		gfp_t gfp_flags = low_order_gfp_flags;
+ 
+ 		if (orders[i] > 4)
+ 			gfp_flags = high_order_gfp_flags;
+--- drivers/staging/wilc1000/linux_wlan.c
++++ drivers/staging/wilc1000/linux_wlan.c
+@@ -1263,8 +1263,8 @@ int wilc_netdev_init(struct wilc **wilc, struct device *dev, int io_type,
+ 		vif->wilc = *wilc;
+ 		vif->ndev = ndev;
+ 		wl->vif[i] = vif;
+-		wl->vif_num = i;
+-		vif->idx = wl->vif_num;
++		wl->vif_num = i + 1;
++		vif->idx = i;
+ 
+ 		ndev->netdev_ops = &wilc_netdev_ops;
+ 
+--- drivers/usb/serial/option.c
++++ drivers/usb/serial/option.c
+@@ -1147,6 +1147,8 @@ static const struct usb_device_id option_ids[] = {
+ 	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_ME910_DUAL_MODEM),
+ 	  .driver_info = NCTRL(0) | RSVD(3) },
++	{ USB_DEVICE_INTERFACE_CLASS(TELIT_VENDOR_ID, 0x1102, 0xff),	/* Telit ME910 (ECM) */
++	  .driver_info = NCTRL(0) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910),
+ 	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910_USBCFG4),
+--- fs/exec.c
++++ fs/exec.c
+@@ -938,7 +938,7 @@ int kernel_read_file(struct file *file, void **buf, loff_t *size,
+ 				    i_size - pos);
+ 		if (bytes < 0) {
+ 			ret = bytes;
+-			goto out;
++			goto out_free;
+ 		}
+ 
+ 		if (bytes == 0)

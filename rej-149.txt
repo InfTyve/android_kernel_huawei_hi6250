@@ -1,0 +1,70 @@
+--- drivers/usb/serial/option.c
++++ drivers/usb/serial/option.c
+@@ -1956,6 +1956,10 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x03f0, 0xa31d, 0xff, 0x06, 0x1b) },
+ 	{ USB_DEVICE(0x1508, 0x1001),						/* Fibocom NL668 */
+ 	  .driver_info = RSVD(4) | RSVD(5) | RSVD(6) },
++	{ USB_DEVICE(0x2cb7, 0x0104),						/* Fibocom NL678 series */
++	  .driver_info = RSVD(4) | RSVD(5) },
++	{ USB_DEVICE_INTERFACE_CLASS(0x2cb7, 0x0105, 0xff),			/* Fibocom NL678 series */
++	  .driver_info = RSVD(6) },
+ 	{ } /* Terminating entry */
+ };
+ MODULE_DEVICE_TABLE(usb, option_ids);
+--- net/ipv4/ip_fragment.c
++++ net/ipv4/ip_fragment.c
+@@ -345,10 +345,10 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+ 	struct net *net = container_of(qp->q.net, struct net, ipv4.frags);
+ 	struct rb_node **rbn, *parent;
+ 	struct sk_buff *skb1, *prev_tail;
++	int ihl, end, skb1_run_end;
+ 	struct net_device *dev;
+ 	unsigned int fragsize;
+ 	int flags, offset;
+-	int ihl, end;
+ 	int err = -ENOENT;
+ 	u8 ecn;
+ 
+@@ -418,7 +418,9 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+ 	 *   overlapping fragment, the entire datagram (and any constituent
+ 	 *   fragments) MUST be silently discarded.
+ 	 *
+-	 * We do the same here for IPv4 (and increment an snmp counter).
++	 * We do the same here for IPv4 (and increment an snmp counter) but
++	 * we do not want to drop the whole queue in response to a duplicate
++	 * fragment.
+ 	 */
+ 
+ 	/* Find out where to put this fragment.  */
+@@ -442,13 +444,17 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+ 		do {
+ 			parent = *rbn;
+ 			skb1 = rb_to_skb(parent);
++			skb1_run_end = skb1->ip_defrag_offset +
++				       FRAG_CB(skb1)->frag_run_len;
+ 			if (end <= skb1->ip_defrag_offset)
+ 				rbn = &parent->rb_left;
+-			else if (offset >= skb1->ip_defrag_offset +
+-						FRAG_CB(skb1)->frag_run_len)
++			else if (offset >= skb1_run_end)
+ 				rbn = &parent->rb_right;
+-			else /* Found an overlap with skb1. */
+-				goto discard_qp;
++			else if (offset >= skb1->ip_defrag_offset &&
++				 end <= skb1_run_end)
++				goto err; /* No new data, potential duplicate */
++			else
++				goto discard_qp; /* Found an overlap */
+ 		} while (*rbn);
+ 		/* Here we have parent properly set, and rbn pointing to
+ 		 * one of its NULL left/right children. Insert skb.
+--- sound/pci/hda/patch_conexant.c
++++ sound/pci/hda/patch_conexant.c
+@@ -853,6 +853,7 @@ static const struct snd_pci_quirk cxt5066_fixups[] = {
+ 	SND_PCI_QUIRK(0x103c, 0x8079, "HP EliteBook 840 G3", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x807C, "HP EliteBook 820 G3", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x80FD, "HP ProBook 640 G2", CXT_FIXUP_HP_DOCK),
++	SND_PCI_QUIRK(0x103c, 0x828c, "HP EliteBook 840 G4", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x83b3, "HP EliteBook 830 G5", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x83d3, "HP ProBook 640 G4", CXT_FIXUP_HP_DOCK),
+ 	SND_PCI_QUIRK(0x103c, 0x8174, "HP Spectre x360", CXT_FIXUP_HP_SPECTRE),

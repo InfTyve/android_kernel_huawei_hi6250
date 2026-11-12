@@ -1,0 +1,178 @@
+--- arch/x86/include/asm/kvm_host.h
++++ arch/x86/include/asm/kvm_host.h
+@@ -487,6 +487,7 @@ struct kvm_vcpu_arch {
+ 	bool tpr_access_reporting;
+ 	u64 ia32_xss;
+ 	u64 microcode_version;
++	u64 arch_capabilities;
+ 
+ 	/*
+ 	 * Paging state of the vcpu
+--- arch/x86/kvm/vmx.c
++++ arch/x86/kvm/vmx.c
+@@ -714,7 +714,6 @@ struct vcpu_vmx {
+ 	u64 		      msr_guest_kernel_gs_base;
+ #endif
+ 
+-	u64 		      arch_capabilities;
+ 	u64 		      spec_ctrl;
+ 
+ 	u32 vm_entry_controls_shadow;
+@@ -3209,12 +3208,6 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 
+ 		msr_info->data = to_vmx(vcpu)->spec_ctrl;
+ 		break;
+-	case MSR_IA32_ARCH_CAPABILITIES:
+-		if (!msr_info->host_initiated &&
+-		    !guest_cpuid_has_arch_capabilities(vcpu))
+-			return 1;
+-		msr_info->data = to_vmx(vcpu)->arch_capabilities;
+-		break;
+ 	case MSR_IA32_SYSENTER_CS:
+ 		msr_info->data = vmcs_read32(GUEST_SYSENTER_CS);
+ 		break;
+@@ -3376,11 +3369,6 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		vmx_disable_intercept_for_msr(vmx->vmcs01.msr_bitmap, MSR_IA32_PRED_CMD,
+ 					      MSR_TYPE_W);
+ 		break;
+-	case MSR_IA32_ARCH_CAPABILITIES:
+-		if (!msr_info->host_initiated)
+-			return 1;
+-		vmx->arch_capabilities = data;
+-		break;
+ 	case MSR_IA32_CR_PAT:
+ 		if (vmcs_config.vmentry_ctrl & VM_ENTRY_LOAD_IA32_PAT) {
+ 			if (!kvm_mtrr_valid(vcpu, MSR_IA32_CR_PAT, data))
+@@ -5468,8 +5456,6 @@ static int vmx_vcpu_setup(struct vcpu_vmx *vmx)
+ 		++vmx->nmsrs;
+ 	}
+ 
+-	vmx->arch_capabilities = kvm_get_arch_capabilities();
+-
+ 	vm_exit_controls_init(vmx, vmcs_config.vmexit_ctrl);
+ 
+ 	/* 22.2.1, 20.8.1 */
+--- arch/x86/kvm/x86.c
++++ arch/x86/kvm/x86.c
+@@ -2478,6 +2483,12 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	case MSR_IA32_UCODE_REV:
+ 		msr_info->data = vcpu->arch.microcode_version;
+ 		break;
++	case MSR_IA32_ARCH_CAPABILITIES:
++		if (!msr_info->host_initiated &&
++		    !guest_cpuid_has_arch_capabilities(vcpu))
++			return 1;
++		msr_info->data = vcpu->arch.arch_capabilities;
++		break;
+ 	case MSR_MTRRcap:
+ 	case 0x200 ... 0x2ff:
+ 		return kvm_mtrr_get_msr(vcpu, msr_info->index, &msr_info->data);
+--- drivers/scsi/sd.c
++++ drivers/scsi/sd.c
+@@ -3255,11 +3253,23 @@ static void scsi_disk_release(struct device *dev)
+ {
+ 	struct scsi_disk *sdkp = to_scsi_disk(dev);
+ 	struct gendisk *disk = sdkp->disk;
+-	
++	struct request_queue *q = disk->queue;
++
+ 	spin_lock(&sd_index_lock);
+ 	ida_remove(&sd_index_ida, sdkp->index);
+ 	spin_unlock(&sd_index_lock);
+ 
++	/*
++	 * Wait until all requests that are in progress have completed.
++	 * This is necessary to avoid that e.g. scsi_end_request() crashes
++	 * due to clearing the disk->private_data pointer. Wait from inside
++	 * scsi_disk_release() instead of from sd_release() to avoid that
++	 * freezing and unfreezing the request queue affects user space I/O
++	 * in case multiple processes open a /dev/sd... node concurrently.
++	 */
++	blk_mq_freeze_queue(q);
++	blk_mq_unfreeze_queue(q);
++
+ 	disk->private_data = NULL;
+ 	put_disk(disk);
+ 	put_device(&sdkp->device->sdev_gendev);
+--- drivers/tty/serial/kgdboc.c
++++ drivers/tty/serial/kgdboc.c
+@@ -148,8 +148,10 @@ static int configure_kgdboc(void)
+ 	char *cptr = config;
+ 	struct console *cons;
+ 
+-	if (!strlen(config) || isspace(config[0]))
++	if (!strlen(config) || isspace(config[0])) {
++		err = 0;
+ 		goto noconfig;
++	}
+ 
+ 	kgdboc_io_ops.is_console = 0;
+ 	kgdb_tty_driver = NULL;
+--- drivers/usb/gadget/function/f_hid.c
++++ drivers/usb/gadget/function/f_hid.c
+@@ -340,20 +340,20 @@ try_again:
+ 	req->complete = f_hidg_req_complete;
+ 	req->context  = hidg;
+ 
++	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
++
+ 	status = usb_ep_queue(hidg->in_ep, hidg->req, GFP_ATOMIC);
+ 	if (status < 0) {
+ 		ERROR(hidg->func.config->cdev,
+ 			"usb_ep_queue error on int endpoint %zd\n", status);
+-		goto release_write_pending_unlocked;
++		goto release_write_pending;
+ 	} else {
+ 		status = count;
+ 	}
+-	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+ 
+ 	return status;
+ release_write_pending:
+ 	spin_lock_irqsave(&hidg->write_spinlock, flags);
+-release_write_pending_unlocked:
+ 	hidg->write_pending = 0;
+ 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+ 
+--- drivers/usb/serial/option.c
++++ drivers/usb/serial/option.c
+@@ -1942,10 +1943,12 @@ static const struct usb_device_id option_ids[] = {
+ 	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7e35, 0xff),			/* D-Link DWM-222 */
+ 	  .driver_info = RSVD(4) },
+-	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) }, /* D-Link DWM-152/C1 */
+-	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/C1 */
+-	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x7e11, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/A3 */
+-	{ USB_DEVICE_INTERFACE_CLASS(0x2020, 0x4000, 0xff) },                /* OLICARD300 - MT6225 */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) },	/* D-Link DWM-152/C1 */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) },	/* D-Link DWM-156/C1 */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x7e11, 0xff, 0xff, 0xff) },	/* D-Link DWM-156/A3 */
++	{ USB_DEVICE_INTERFACE_CLASS(0x2020, 0x2031, 0xff),			/* Olicard 600 */
++	  .driver_info = RSVD(4) },
++	{ USB_DEVICE_INTERFACE_CLASS(0x2020, 0x4000, 0xff) },			/* OLICARD300 - MT6225 */
+ 	{ USB_DEVICE(INOVIA_VENDOR_ID, INOVIA_SEW858) },
+ 	{ USB_DEVICE(VIATELECOM_VENDOR_ID, VIATELECOM_PRODUCT_CDS7) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(WETELECOM_VENDOR_ID, WETELECOM_PRODUCT_WMD200, 0xff, 0xff, 0xff) },
+--- drivers/video/fbdev/goldfishfb.c
++++ drivers/video/fbdev/goldfishfb.c
+@@ -234,7 +234,7 @@ static int goldfish_fb_probe(struct platform_device *pdev)
+ 	fb->fb.var.activate	= FB_ACTIVATE_NOW;
+ 	fb->fb.var.height	= readl(fb->reg_base + FB_GET_PHYS_HEIGHT);
+ 	fb->fb.var.width	= readl(fb->reg_base + FB_GET_PHYS_WIDTH);
+-	fb->fb.var.pixclock	= 10000;
++	fb->fb.var.pixclock	= 0;
+ 
+ 	fb->fb.var.red.offset = 11;
+ 	fb->fb.var.red.length = 5;
+--- fs/nfs/nfs4proc.c
++++ fs/nfs/nfs4proc.c
+@@ -2748,7 +2748,8 @@ static int _nfs4_open_and_get_state(struct nfs4_opendata *opendata,
+ 			nfs4_schedule_stateid_recovery(server, state);
+ 	}
+ out:
+-	nfs4_sequence_free_slot(&opendata->o_res.seq_res);
++	if (!opendata->cancelled)
++		nfs4_sequence_free_slot(&opendata->o_res.seq_res);
+ 	return ret;
+ }
+ 

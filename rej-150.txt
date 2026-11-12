@@ -1,0 +1,33 @@
+--- drivers/gpu/drm/vc4/vc4_plane.c
++++ drivers/gpu/drm/vc4/vc4_plane.c
+@@ -352,6 +352,7 @@ static int vc4_plane_setup_clipping_and_scaling(struct drm_plane_state *state)
+ 		if (vc4_state->is_unity)
+ 			vc4_state->x_scaling[0] = VC4_SCALING_PPF;
+ 	} else {
++		vc4_state->is_yuv = false;
+ 		vc4_state->x_scaling[1] = VC4_SCALING_NONE;
+ 		vc4_state->y_scaling[1] = VC4_SCALING_NONE;
+ 	}
+--- drivers/pinctrl/meson/pinctrl-meson.c
++++ drivers/pinctrl/meson/pinctrl-meson.c
+@@ -274,7 +274,8 @@ static int meson_pinconf_set(struct pinctrl_dev *pcdev, unsigned int pin,
+ 		case PIN_CONFIG_BIAS_DISABLE:
+ 			dev_dbg(pc->dev, "pin %u: disable bias\n", pin);
+ 
+-			meson_calc_reg_and_bit(bank, pin, REG_PULL, &reg, &bit);
++			meson_calc_reg_and_bit(bank, pin, REG_PULLEN, &reg,
++					       &bit);
+ 			ret = regmap_update_bits(pc->reg_pullen, reg,
+ 						 BIT(bit), 0);
+ 			if (ret)
+--- net/ceph/auth_x.c
++++ net/ceph/auth_x.c
+@@ -804,7 +804,7 @@ static int calc_signature(struct ceph_x_authorizer *au, struct ceph_msg *msg,
+ 	void *enc_buf = au->enc_buf;
+ 	int ret;
+ 
+-	if (msg->con->peer_features & CEPH_FEATURE_CEPHX_V2) {
++	if (!(msg->con->peer_features & CEPH_FEATURE_CEPHX_V2)) {
+ 		struct {
+ 			__le32 len;
+ 			__le32 header_crc;
