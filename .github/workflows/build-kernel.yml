@@ -1,0 +1,185 @@
+name: build-kernel
+
+# 手动触发：Actions → build-kernel → Run workflow
+# 打 tag 触发：git tag v1.0 && git push origin v1.0
+on:
+  workflow_dispatch:
+    inputs:
+      ksu:
+        description: 'KernelSU（false = 编纯净版）'
+        type: boolean
+        default: true
+      build_user:
+        description: 'KBUILD_BUILD_USER（uname -r 里 @ 前面那段）'
+        default: 'TeYun'
+      build_host:
+        description: 'KBUILD_BUILD_HOST（@ 后面那段）'
+        default: '114514'
+      publish:
+        description: '构建完成后发布到 Release'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release tag（留空则自动生成）'
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-android-
+  # 工具链来自本仓库的 toolchain-4.9 Release，缓存在 Actions 里
+  TOOLCHAIN_ASSET: aarch64-linux-android-4.9.tar.xz
+  TOOLCHAIN_CACHE_KEY: toolchain-aarch64-linux-android-4.9-v1
+  KBUILD_USER: ${{ github.event.inputs.build_user || 'TeYun' }}
+  KBUILD_HOST: ${{ github.event.inputs.build_host || '114514' }}
+  KSU: ${{ github.event.inputs.ksu || 'true' }}
+
+jobs:
+  build:
+    name: hi6250 / arm64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev zip unzip xz-utils cpio kmod
+
+      - name: 还原工具链缓存
+        uses: actions/cache@v4
+        with:
+          path: .toolchain
+          key: ${{ env.TOOLCHAIN_CACHE_KEY }}
+
+      - name: 准备 GCC 4.9 工具链
+        run: |
+          set -euo pipefail
+          if [ -x .toolchain/bin/aarch64-linux-android-gcc ]; then
+            echo "工具链已在缓存中，跳过下载"
+          else
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchain-4.9/${TOOLCHAIN_ASSET}"
+            echo "下载 $URL"
+            curl -fL --retry 3 --retry-delay 5 -o /tmp/tc.tar.xz "$URL"
+            mkdir -p .toolchain
+            tar -xJf /tmp/tc.tar.xz -C .toolchain
+          fi
+          # AOSP 的 gcc 驱动是个 python wrapper，老版本 shebang 指向 python2
+          for f in .toolchain/bin/aarch64-linux-android-gcc .toolchain/bin/aarch64-linux-android-g++; do
+            [ -f "$f" ] && head -1 "$f" | grep -q python && sed -i '1s|.*|#!/usr/bin/env python3|' "$f"
+          done
+          export PATH="$PWD/.toolchain/bin:$PATH"
+          aarch64-linux-android-gcc --version | head -1
+
+      - name: 配置内核
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.toolchain/bin:$PATH"
+          make -s ARCH=arm64 O=out merge_hi6250_defconfig
+          if [ "$KSU" != "true" ]; then
+            ./scripts/config --file out/.config -d KSU
+            echo "已关闭 CONFIG_KSU"
+          fi
+          grep -E '^CONFIG_KSU|^# CONFIG_KSU' out/.config || true
+          grep -E '^CONFIG_LOCALVERSION' out/.config || true
+
+      - name: 编译 Image.gz
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.toolchain/bin:$PATH"
+          # -fcommon：宿主机 gcc>=10 默认 -fno-common，会让 yylloc 重复定义
+          # LOCALVERSION= ：清空后 setlocalversion 不再追加 "+"（版本串才稳定）
+          make ARCH=arm64 O=out -j"$(nproc)" LOCALVERSION= \
+            KBUILD_BUILD_USER="$KBUILD_USER" \
+            KBUILD_BUILD_HOST="$KBUILD_HOST" \
+            KBUILD_BUILD_VERSION=1 \
+            HOSTCFLAGS="-Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89 -fcommon" \
+            Image.gz
+          ls -l out/arch/arm64/boot/Image.gz
+          make -s ARCH=arm64 O=out LOCALVERSION= kernelrelease | tee /tmp/krel.txt
+
+      - name: 打包内核镜像
+        run: |
+          set -euo pipefail
+          KREL=$(cat /tmp/krel.txt)
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+          NAME="kernel-$KREL"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+          mkdir -p dist
+          cp out/arch/arm64/boot/Image.gz "dist/$NAME-Image.gz"
+          python3 ci/mkbootimg-hi6250.py \
+            --header ci/bootheader-hi6250.bin \
+            --kernel out/arch/arm64/boot/Image.gz \
+            --output "dist/$NAME.img"
+          cp out/System.map "dist/$NAME-System.map"
+          cp out/.config "dist/$NAME-defconfig"
+
+          ( cd dist && zip -q -9 "$NAME.zip" "$NAME.img" )
+          ( cd dist && sha256sum "$NAME.img" "$NAME.zip" "$NAME-Image.gz" > "$NAME-SHA256SUMS.txt" )
+          ls -lh dist
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### hi6250 内核构建完成"
+            echo
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| uname -r | \`$KREL\` |"
+            echo "| KernelSU | \`$KSU\` |"
+            echo "| 编译器 | GCC 4.9 (aarch64-linux-android) |"
+            echo "| 提交 | \`$GITHUB_SHA\` |"
+            echo
+            echo '```'
+            cat "dist/$NAME-SHA256SUMS.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 Release
+        if: github.ref_type == 'tag' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              TAG="$GITHUB_REF_NAME"
+            else
+              TAG="build-$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA:0:7}"
+            fi
+          fi
+          echo "发布到 tag: $TAG"
+          NOTES="自动构建：$KREL
+          KernelSU: $KSU
+          刷入：fastboot flash kernel <img> 后接 fastboot -w（建议先 --disable-verification flash vbmeta）"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$KREL" --notes "$NOTES"
+          fi
