@@ -104,10 +104,12 @@ jobs:
           export PATH="$PWD/.toolchain/bin:$PATH"
           # -fcommon：宿主机 gcc>=10 默认 -fno-common，会让 yylloc 重复定义
           # LOCALVERSION= ：清空后 setlocalversion 不再追加 "+"（版本串才稳定）
+          # KBUILD_BUILD_TIMESTAMP：取提交时间，保证同一份源码每次编出同样的镜像
           make ARCH=arm64 O=out -j"$(nproc)" LOCALVERSION= \
             KBUILD_BUILD_USER="$KBUILD_USER" \
             KBUILD_BUILD_HOST="$KBUILD_HOST" \
             KBUILD_BUILD_VERSION=1 \
+            KBUILD_BUILD_TIMESTAMP="$(git log -1 --format=%cD)" \
             HOSTCFLAGS="-Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89 -fcommon" \
             Image.gz
           ls -l out/arch/arm64/boot/Image.gz
@@ -175,9 +177,19 @@ jobs:
             fi
           fi
           echo "发布到 tag: $TAG"
-          NOTES="自动构建：$KREL
-          KernelSU: $KSU
-          刷入：fastboot flash kernel <img> 后接 fastboot -w（建议先 --disable-verification flash vbmeta）"
+          NOTES=$(printf '%s\n' \
+            "自动构建：$KREL" \
+            "" \
+            "- KernelSU: $KSU" \
+            "- 编译器: GCC 4.9 aarch64-linux-android" \
+            "- 提交: $GITHUB_SHA" \
+            "" \
+            "刷入：" \
+            '```' \
+            "fastboot --disable-verification flash vbmeta ven/vbmeta.img" \
+            "fastboot flash kernel $NAME.img" \
+            "fastboot -w" \
+            '```')
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
